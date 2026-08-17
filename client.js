@@ -193,6 +193,7 @@ window.__ModuleLoader__.load({
 			const onTitle = opts.onTitle;
 			const onClose = opts.onClose;
 			const onFit = opts.onFit || (() => {});
+			const onBrowse = opts.onBrowse || (() => {}); // 退出播放视图（回浏览/欢迎页）时通知面板恢复初始窗口尺寸
 			const onToggleFullscreen = opts.onToggleFullscreen || (() => {});
 
 			/* DOM */
@@ -303,6 +304,7 @@ window.__ModuleLoader__.load({
 				playBtn.textContent = "▶ 播放此文件夹";
 				playBtn.disabled = true;
 				onTitle("");
+				onBrowse();
 			}
 
 			async function loadDir(p) {
@@ -374,6 +376,7 @@ window.__ModuleLoader__.load({
 				topbar.hidden = true;
 				bottombar.hidden = true;
 				chip.hidden = true;
+				if (!disposed) onBrowse();
 			}
 			browseBtn.addEventListener("click", () => (dir ? loadDir(dir) : welcome()));
 			backTop.addEventListener("click", () => goTo(0));
@@ -853,6 +856,13 @@ window.__ModuleLoader__.load({
 							autoFitRef.current = true;
 						}
 						setMeta({ w, h });
+					},
+					// 回到浏览/欢迎视图：窗口恢复初始默认尺寸（避免小视频适配尺寸挡住按钮）
+					onBrowse: () => {
+						metaIdxRef.current = -1;
+						setSize(null);
+						setMeta(null);
+						autoFitRef.current = true;
 					},
 					onToggleFullscreen: toggleFullscreen
 				});
