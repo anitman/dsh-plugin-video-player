@@ -1,0 +1,3 @@
+- insert:
+    - id: video-player
+      name: dsh-plugin-video-player

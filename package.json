@@ -1,0 +1,28 @@
+{
+	"name": "dsh-plugin-video-player",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "DSH web GUI 客户端插件：刷视频窗口（选文件夹 / 抖音式竖屏刷视频 / ←→ 快进 / ↑↓ 或拖拽切换）",
+	"main": "index.js",
+	"exports": {
+		".": "./index.js",
+		"./client": "./client.js",
+		"./cordis.patch.yml": "./cordis.patch.yml",
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"index.js",
+		"client.js",
+		"cordis.patch.yml",
+		"README.md"
+	],
+	"dsh": {
+		"bundle": {
+			"patch": "./cordis.patch.yml"
+		},
+		"client": {
+			"platform": "web"
+		}
+	}
+}
