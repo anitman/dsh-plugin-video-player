@@ -327,8 +327,7 @@ async function extractJson(args, cookieName, timeoutMs) {
 function hintYt(msg) {
 	const t = String(msg || "");
 	if (/not a bot|Sign in to confirm/i.test(t)) {
-		return t.split("
-")[0].slice(0, 120) + "；（YouTube 正在风控当前网络/IP：稍后重试；或用已登录 YouTube 的浏览器重新导出该站 cookies.txt，在 🍪 行上传后再试）";
+		return t.split("\n")[0].slice(0, 120) + "；（YouTube 正在风控当前网络/IP：稍后重试；或用已登录 YouTube 的浏览器重新导出该站 cookies.txt，在 🍪 行上传后再试）";
 	}
 	return t;
 }
