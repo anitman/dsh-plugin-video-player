@@ -90,6 +90,9 @@ window.__ModuleLoader__.load({
 			".vdpv-card-sub{font-size:12px;font-weight:400;opacity:.65;max-width:300px;line-height:1.8;white-space:pre-line}",
 			".vdpv-browse{width:100%;max-width:320px;flex-direction:column;gap:8px;margin-top:6px;display:flex}",
 			".vdpv-input{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:8px;padding:6px 10px;font:inherit;font-size:12px}",
+			".vdpv-cookie-row{width:100%;display:flex;gap:6px;align-items:center}",
+			".vdpv-cookie-row .tip{flex:none;font-size:12px;opacity:.8}",
+			".vdpv-cookie-row select{flex:1;min-width:0;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:8px;padding:6px 8px;font:inherit;font-size:12px}",
 			".vdpv-rows{flex-direction:column;gap:2px;max-height:40vh;overflow:auto;display:flex}",
 			".vdpv-row{width:100%;cursor:pointer;gap:8px;align-items:center;background:0 0;border:none;border-radius:6px;padding:6px 10px;font:inherit;font-size:13px;color:#fff;text-align:left;display:flex}",
 			".vdpv-row:hover{background:rgba(255,255,255,.1)}",
@@ -109,18 +112,26 @@ window.__ModuleLoader__.load({
 		}
 
 		/* ── 基础工具 ── */
-		async function api(pathname, query) {
-			const res = await fetch(pathname + "?" + query, { cache: "no-store" });
-			let body = null;
-			try {
-				body = await res.json();
-			} catch {
-				body = null;
+		async function api(pathname, query, method, payload) {
+			const init = { cache: "no-store" };
+			if (method) init.method = method;
+			if (payload !== undefined) {
+				init.body = JSON.stringify(payload);
+				init.headers = { "content-type": "application/json" };
 			}
-			if (!body || body.ok !== true) throw new Error((body && body.error) || "HTTP " + res.status);
-			return body;
+			const res = await fetch(pathname + (query ? "?" + query : ""), init);
+			let data = null;
+			try {
+				data = await res.json();
+			} catch {
+				data = null;
+			}
+			if (!data || data.ok !== true) throw new Error((data && data.error) || "HTTP " + res.status);
+			return data;
 		}
-		const streamUrl = (path) => "/video-player/stream?path=" + encodeURIComponent(path);
+		let activeCookie = ""; // 当前选中的 cookies.txt（引擎界面维护，供 list/stream 透传）
+		const cookieQ = () => (activeCookie ? "&cookie=" + encodeURIComponent(activeCookie) : "");
+		const streamUrl = (path) => "/video-player/stream?path=" + encodeURIComponent(path) + cookieQ();
 		const el = (tag, cls) => {
 			const n = document.createElement(tag);
 			if (cls) n.className = cls;
@@ -239,12 +250,31 @@ window.__ModuleLoader__.load({
 			const browseWrap = el("div", "vdpv-browse");
 			const input = el("input", "vdpv-input");
 			input.placeholder = isWin
-				? "文件夹路径，如 \\192.168.1.100\\视频 或 smb://主机/共享，回车浏览"
-				: "文件夹绝对路径 或 smb://主机/共享，回车浏览";
+				? "文件夹路径（如 \\192.168.1.100\\视频）或 视频/UP主网址，回车浏览"
+				: "文件夹绝对路径 或 视频/UP主网址（yt-dlp 支持），回车浏览";
 			const rows = el("div", "vdpv-rows");
 			const playBtn = el("button", "vdpv-playbtn");
 			playBtn.type = "button";
-			browseWrap.append(input, rows, playBtn);
+			const cookieRow = el("div", "vdpv-cookie-row");
+			const cookieTip = el("span", "tip");
+			cookieTip.textContent = "🍪";
+			cookieTip.title = "yt-dlp 登录态（cookies.txt，浏览器导出格式）：高清/会员内容需要";
+			const cookieSel = el("select");
+			cookieSel.title = "选择上传的 cookies.txt";
+			const cookieUp = el("button", "vdpv-tbtn");
+			cookieUp.type = "button";
+			cookieUp.textContent = "上传";
+			cookieUp.title = "上传 cookies.txt 文件";
+			const cookieDel = el("button", "vdpv-tbtn");
+			cookieDel.type = "button";
+			cookieDel.textContent = "🗑";
+			cookieDel.title = "删除已选的 cookies.txt";
+			const cookieFile = el("input");
+			cookieFile.type = "file";
+			cookieFile.accept = ".txt";
+			cookieFile.style.display = "none";
+			cookieRow.append(cookieTip, cookieSel, cookieUp, cookieDel, cookieFile);
+			browseWrap.append(input, cookieRow, rows, playBtn);
 			card.append(cardTitle, cardSub, browseWrap);
 
 			const endCard = el("div", "vdpv-card");
@@ -300,6 +330,7 @@ window.__ModuleLoader__.load({
 					true
 				);
 				input.value = "";
+				refreshCookieSelect();
 				rows.innerHTML = "";
 				playBtn.textContent = "▶ 播放此文件夹";
 				playBtn.disabled = true;
@@ -311,7 +342,7 @@ window.__ModuleLoader__.load({
 				setCard("正在加载…", p, true);
 				input.value = p;
 				try {
-					const data = await api("/video-player/list", "dir=" + encodeURIComponent(p));
+					const data = await api("/video-player/list", "dir=" + encodeURIComponent(p) + cookieQ());
 					if (disposed) return;
 					dir = data.dir;
 					input.value = dir;
@@ -328,9 +359,10 @@ window.__ModuleLoader__.load({
 				card.hidden = false;
 				cardTitle.textContent = "📺 刷视频";
 				cardSub.textContent =
-					"此文件夹 " + data.videos.length + " 个视频" + (data.truncated ? "（已达上限）" : "") +
+					(data.parent ? "此文件夹 " : "此列表 ") + data.videos.length + " 个视频" + (data.truncated ? "（已达上限）" : "") +
 					"\n↑↓ / 拖拽 切换 · ←→ 快进 · 空格 暂停 · M 静音";
 				rows.innerHTML = "";
+				refreshCookieSelect();
 				if (data.parent) rows.appendChild(makeRow("↑", "上一级", () => loadDir(data.parent), data.parent));
 				for (const d of data.dirs) rows.appendChild(makeRow("📁", d.name, () => loadDir(d.path), d.path));
 				playBtn.textContent = data.videos.length
@@ -378,6 +410,60 @@ window.__ModuleLoader__.load({
 				chip.hidden = true;
 				if (!disposed) onBrowse();
 			}
+			/* cookies 管理（yt-dlp 登录态，用于在线视频高清/会员内容） */
+			let cookieName = "";
+			try { cookieName = localStorage.getItem("vdpv.cookie") || ""; } catch { cookieName = ""; }
+			activeCookie = cookieName;
+			async function refreshCookieSelect() {
+				let names = [];
+				try { names = (await api("/video-player/cookies")).cookies.map((c) => c.name); } catch { names = []; }
+				cookieSel.innerHTML = "";
+				const o0 = el("option");
+				o0.value = "";
+				o0.textContent = "无 cookie";
+				cookieSel.appendChild(o0);
+				for (const n of names) {
+					const o = el("option");
+					o.value = n;
+					o.textContent = n;
+					cookieSel.appendChild(o);
+				}
+				cookieSel.value = names.includes(cookieName) ? cookieName : "";
+			}
+			cookieSel.addEventListener("change", () => {
+				cookieName = cookieSel.value;
+				activeCookie = cookieName;
+				try { localStorage.setItem("vdpv.cookie", cookieName); } catch { /* ignore */ }
+			});
+			cookieUp.addEventListener("click", () => cookieFile.click());
+			cookieFile.addEventListener("change", async () => {
+				const f = cookieFile.files && cookieFile.files[0];
+				cookieFile.value = "";
+				if (!f) return;
+				let text = "";
+				try { text = await f.text(); } catch { return; }
+				const name = f.name.replace(/\.txt$/i, "").replace(/[^\w.-]/g, "_") || "cookies";
+				try {
+					await api("/video-player/cookies", null, "POST", { name, data: text });
+				} catch (e) {
+					flash("cookie 上传失败：" + e.message, true);
+					return;
+				}
+				cookieName = name;
+				activeCookie = name;
+				try { localStorage.setItem("vdpv.cookie", name); } catch { /* ignore */ }
+				await refreshCookieSelect();
+				flash("🍪 已上传 cookie：" + name, true);
+			});
+			cookieDel.addEventListener("click", async () => {
+				if (!cookieName) { flash("当前没有已选的 cookie", true); return; }
+				if (!confirm("删除 cookie 文件 " + cookieName + ".txt？")) return;
+				try { await api("/video-player/cookies", "name=" + encodeURIComponent(cookieName), "DELETE"); } catch { /* ignore */ }
+				cookieName = "";
+				activeCookie = "";
+				try { localStorage.setItem("vdpv.cookie", ""); } catch { /* ignore */ }
+				await refreshCookieSelect();
+			});
 			browseBtn.addEventListener("click", () => (dir ? loadDir(dir) : welcome()));
 			backTop.addEventListener("click", () => goTo(0));
 

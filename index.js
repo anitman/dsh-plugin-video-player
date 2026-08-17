@@ -20,10 +20,12 @@
  *     直接填挂载点路径即可；填 smb:// 或 \\UNC 时宿主解析 `mount` 输出
  *     换算成本地挂载路径（凭据由系统挂载时处理，不经过本插件）。
  */
-import { createReadStream } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { createReadStream, existsSync } from "node:fs";
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
-import { execSync } from "node:child_process";
+import { execFile, execSync } from "node:child_process";
+import { homedir } from "node:os";
+import { Readable } from "node:stream";
 
 const MAX_FILES = 2000;
 const MAX_DEPTH = 8;
@@ -166,98 +168,364 @@ function resolveLocalPath(input) {
 	return raw;
 }
 
-function json(res, code, body) {
-	res.writeHead(code, {
-		"content-type": "application/json; charset=utf-8",
-		"cache-control": "no-cache"
-	});
-	res.end(JSON.stringify(body));
-}
+/* ── yt-dlp 在线视频（网址列表 + 代理直播） ──
+ * 面板地址栏可粘贴 yt-dlp 支持的视频/播放列表网址（bilibili、YouTube 等）：
+ *   - list：yt-dlp --flat-playlist 拉取列表（内存缓存 30 分钟）；
+ *   - stream：单文件渐进流由宿主代理转发（补 UA/Referer/Cookie，Range 透传）；
+ *     DASH/HLS 分段流（bilibili 全 DASH）自动 yt-dlp 下载合并为本地 mp4（≤1080p，
+ *     需 ffmpeg），之后本地 Range 流播放，同一视频只下一次。
+ * cookies.txt 存于 ~/.dsh/video-player/cookies/，供高清/登录态使用；
+ * 本机配置 ~/.dsh/video-player/config.json（"ytdlp"/"ffmpeg" 路径，不入库）。 */
+const COOKIE_DIR = join(homedir(), ".dsh", "video-player", "cookies");
+const COOKIE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const REMOTE_TTL = 30 * 60 * 1000;
+const remoteCache = new Map();
+const directCache = new Map();
+const directFailCache = new Map(); // 无直连流的 watch → 时间戳（10 分钟内不再尝试 yt-dlp 解析）
+const DIRECT_FAIL_TTL = 10 * 60 * 1000;
 
-function queryParam(url, key) {
-	const raw = url.searchParams.get(key);
+async function cookiePath(name) {
+	if (!COOKIE_NAME_RE.test(name || "")) throw Object.assign(new Error("invalid cookie name"), { status: 400 });
+	return join(COOKIE_DIR, name + ".txt");
+}
+async function listCookies() {
 	try {
-		return raw === null ? "" : decodeURIComponent(raw);
+		const entries = await readdir(COOKIE_DIR, { withFileTypes: true });
+		const out = [];
+		for (const e of entries) {
+			if (!e.isFile() || !e.name.endsWith(".txt")) continue;
+			const st = await stat(join(COOKIE_DIR, e.name));
+			out.push({ name: e.name.slice(0, -4), size: st.size, mtime: st.mtimeMs });
+		}
+		out.sort((a, b) => b.mtime - a.mtime);
+		return out;
+	} catch {
+		return [];
+	}
+}
+async function readCookieHeader(name, host) {
+	try {
+		const text = await readFile(await cookiePath(name), "utf8");
+		return parseCookiesHeader(text, host);
 	} catch {
 		return "";
 	}
 }
-
-/** 递归收集视频文件（数量/深度上限保护），跳过不可读条目。 */
-async function collectVideos(dir, depth, acc) {
-	if (acc.length >= MAX_FILES || depth > MAX_DEPTH) return;
-	let entries;
-	try {
-		entries = await readdir(dir, { withFileTypes: true });
-	} catch {
-		return;
+/** Netscape cookies.txt → "k=v; k=v"（只取未过期、且域匹配 host 的条目；
+ * 浏览器整站导出的 cookies.txt 常含大量无关域，全发会超 CDN 头大小限制）。 */
+function parseCookiesHeader(text, host) {
+	const now = Math.floor(Date.now() / 1000);
+	const pairs = [];
+	let h = String(host || "").toLowerCase();
+	for (const line of String(text).split(/\r?\n/)) {
+		if (!line || line.startsWith("#")) continue;
+		const f = line.split("\t");
+		if (f.length < 7) continue;
+		const exp = Number(f[4]);
+		if (exp && exp < now) continue;
+		if (h) {
+			const d = String(f[0] || "").toLowerCase().replace(/^\./, "");
+			if (d && !(h === d || h.endsWith("." + d))) continue;
+		}
+		pairs.push(f[5] + "=" + f[6]);
 	}
-	for (const e of entries) {
-		if (acc.length >= MAX_FILES) break;
-		const full = join(dir, e.name);
-		try {
-			if (e.isDirectory()) {
-				await collectVideos(full, depth + 1, acc);
-			} else if (e.isFile() && isVideo(e.name)) {
-				const st = await stat(full);
-				acc.push({ name: e.name, path: full, size: st.size, mtimeMs: st.mtimeMs });
+	return pairs.join("; ");
+}
+async function saveCookie(name, text) {
+	if (!COOKIE_NAME_RE.test(name || "")) throw Object.assign(new Error("invalid cookie name"), { status: 400 });
+	if (typeof text !== "string" || !text.length) throw Object.assign(new Error("empty cookie file"), { status: 400 });
+	if (text.length > 5 * 1024 * 1024) throw Object.assign(new Error("cookie file too large"), { status: 400 });
+	await mkdir(COOKIE_DIR, { recursive: true });
+	await writeFile(await cookiePath(name), text, "utf8");
+}
+async function deleteCookie(name) {
+	await unlink(await cookiePath(name)).catch(() => {});
+}
+
+/* yt-dlp 定位与执行：本机配置（~/.dsh/video-player/config.json 的 "ytdlp" 字段）
+ * > DVP_YTDLP 环境变量 > PATH（yt-dlp / yt-dlp.exe）> python -m yt_dlp。
+ * 机器特定路径只放在本机配置里，仓库代码不包含任何人的本地环境。 */
+const LOCAL_CONFIG = join(homedir(), ".dsh", "video-player", "config.json");
+async function ytdlpCandidates() {
+	const out = [];
+	try {
+		const c = JSON.parse(await readFile(LOCAL_CONFIG, "utf8"));
+		if (typeof c.ytdlp === "string" && c.ytdlp.trim()) out.push({ cmd: c.ytdlp.trim(), args: [] });
+	} catch {
+		/* 无本机配置则跳过 */
+	}
+	if (process.env.DVP_YTDLP) out.push({ cmd: process.env.DVP_YTDLP, args: [] });
+	out.push({ cmd: "yt-dlp", args: [] });
+	if (process.platform === "win32") out.push({ cmd: "yt-dlp.exe", args: [] });
+	out.push({ cmd: process.platform === "win32" ? "python" : "python3", args: ["-m", "yt_dlp"] });
+	return out;
+}
+let ytdlpCmdPromise = null;
+function ytdlpExec(cmd, args, timeoutMs) {
+	return new Promise((resolve, reject) => {
+		execFile(cmd, args, { timeout: timeoutMs, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+			if (err) {
+				const msg = String(stderr || err.message || "").trim().split("\n").filter(Boolean).slice(-2).join(" ");
+				reject(Object.assign(new Error(msg || "yt-dlp failed"), { status: 502 }));
+			} else resolve(stdout);
+		});
+	});
+}
+function ytdlpCmd() {
+	if (!ytdlpCmdPromise) {
+		ytdlpCmdPromise = (async () => {
+			for (const c of await ytdlpCandidates()) {
+				try {
+					await ytdlpExec(c.cmd, [...c.args, "--version"], 8000);
+					return c;
+				} catch {
+					/* 试下一个 */
+				}
 			}
-		} catch {
-			/* 跳过无法读取的条目 */
+			throw Object.assign(new Error("找不到 yt-dlp：请安装后加入 PATH，或设 DVP_YTDLP 环境变量，或在 " + LOCAL_CONFIG + " 配置 {\"ytdlp\":\"<yt-dlp 可执行路径>\"}"), { status: 500 });
+		})();
+	}
+	return ytdlpCmdPromise;
+}
+let ffmpegLocPromise = null;
+function ffmpegLocation() {
+	if (!ffmpegLocPromise) {
+		ffmpegLocPromise = (async () => {
+			try {
+				const c = JSON.parse(await readFile(LOCAL_CONFIG, "utf8"));
+				if (typeof c.ffmpeg === "string" && c.ffmpeg.trim()) return c.ffmpeg.trim();
+			} catch {
+				/* 无本机配置 → 依赖 PATH */
+			}
+			return "";
+		})();
+	}
+	return ffmpegLocPromise;
+}
+async function runYtdlp(args, timeoutMs) {
+	const c = await ytdlpCmd();
+	const ff = await ffmpegLocation();
+	/* 浏览器 UA：bilibili 等站对 yt-dlp 默认 UA 有 352/412 风控 */
+	return ytdlpExec(c.cmd, [...c.args, ...(ff ? ["--ffmpeg-location", ff] : []), "--user-agent", UA, ...args], timeoutMs);
+}
+
+/* 远程列表：网址 → yt-dlp flat-playlist → 与本地目录同构的 videos 数组 */
+function isRemoteDir(raw) {
+	return /^https?:\/\//i.test(raw) || /^(bilibili|youtube|twitter|x|vimeo|tiktok):/i.test(raw);
+}
+function makeYtPath(entry, listUrl) {
+	const id = entry.id || "";
+	let watch = entry.url || entry.webpage_url || "";
+	if (!/^https?:\/\//i.test(watch)) {
+		if (/(bilibili\.com)/i.test(listUrl) && /^BV/i.test(id)) watch = "https://www.bilibili.com/video/" + id;
+		else watch = listUrl;
+	}
+	return "yt|" + watch + "|" + listUrl;
+}
+function parseYtPath(p) {
+	const i = p.indexOf("|", 3);
+	if (i < 0) return null;
+	return { watch: p.slice(3, i), list: p.slice(i + 1) };
+}
+async function handleRemoteList(rawDir, cookieName, res) {
+	const key = rawDir + "\u0000" + (cookieName || "");
+	const now = Date.now();
+	const hit = remoteCache.get(key);
+	if (hit && now - hit.at < REMOTE_TTL) return json(res, 200, { ok: true, ...hit.data });
+	const args = ["-J", "--flat-playlist", "--no-warnings", "--ignore-config"];
+	if (cookieName) {
+		try { args.push("--cookies", await cookiePath(cookieName)); }
+		catch (e) { return json(res, e.status || 400, { ok: false, error: e.message }); }
+	}
+	args.push(rawDir);
+	let data;
+	try {
+		data = JSON.parse(await runYtdlp(args, 45000));
+	} catch (e) {
+		return json(res, 502, { ok: false, error: "yt-dlp 获取列表失败：" + e.message });
+	}
+	const entries = Array.isArray(data.entries) ? data.entries : [data];
+	const videos = entries.filter((e) => e && (e.id || e.url)).slice(0, MAX_FILES).map((e) => ({
+		name: e.title || e.id || e.url,
+		path: makeYtPath(e, rawDir)
+	}));
+	if (!videos.length) return json(res, 400, { ok: false, error: "未解析到视频（网址可能不是视频/播放列表页）" });
+	const out = { dir: rawDir, parent: null, dirs: [], videos };
+	remoteCache.set(key, { at: now, data: out });
+	return json(res, 200, { ok: true, ...out });
+}
+
+/* 直连地址解析 + 代理转发（Range 透传；403/404/410 刷新地址重试一次） */
+async function resolveDirectUrl(watch, cookieName) {
+	const key = watch + "\u0000" + (cookieName || "");
+	const hit = directCache.get(key);
+	if (hit && Date.now() - hit.at < REMOTE_TTL) return hit.url;
+	/* 负缓存：该地址无单文件直连流 → 跳过 yt-dlp 解析，直接走缓存下载 */
+	const failAt = directFailCache.get(key);
+	if (failAt && Date.now() - failAt < DIRECT_FAIL_TTL) throw Object.assign(new Error("无直连流（负缓存）"), { status: 501 });
+	/* 网址本身即视频文件直链 → 直接返回（泛型 CDN 支持 Range） */
+	if (/\.(mp4|webm|m4v|mov|ogv|mkv)(\?|$)/i.test(watch)) {
+		directCache.set(key, { at: Date.now(), url: watch });
+		return watch;
+	}
+	let cookieArg = [];
+	if (cookieName) {
+		try { cookieArg = ["--cookies", await cookiePath(cookieName)]; } catch { cookieArg = []; }
+	}
+	/* 三级回退：单文件 MP4 优先；取不到再最佳格式；多P/合集用 --playlist-items 1 */
+	const common = ["--no-warnings", "--ignore-config", ...cookieArg];
+	const attempts = [
+		["--get-url", "-f", "b[ext=mp4][acodec!=none]/b[ext=webm][acodec!=none]/b[ext=m4v][acodec!=none]", "--no-playlist", ...common, watch],
+		["--get-url", "-f", "b", "--no-playlist", ...common, watch],
+		["--get-url", "-f", "b", "--playlist-items", "1", ...common, watch]
+	];
+	let url = "";
+	let lastErr = "";
+	for (const args of attempts) {
+		try {
+			url = (await runYtdlp(args, 45000)).trim();
+			if (/^https?:\/\//i.test(url)) break;
+			url = "";
+		} catch (e) {
+			lastErr = String(e.message || "");
+			url = "";
 		}
 	}
+	if (!url) {
+		/* “格式不可用”= 该站没有单文件流（bilibili 全 DASH）→ 负缓存 10 分钟 */
+		if (/not available|no video/i.test(lastErr)) directFailCache.set(key, Date.now());
+		throw Object.assign(new Error("yt-dlp 未能解析出可播放地址" + (lastErr ? "：" + lastErr.slice(0, 120) : "")), { status: 502 });
+	}
+	if (/\.(m3u8|mpd|m4s)(\?|$)/i.test(url)) {
+		directFailCache.set(key, Date.now());
+		throw Object.assign(new Error("该视频只有 HLS/DASH 分段流，暂不支持在线直播（可先用 yt-dlp 下载到本地文件夹再播放）"), { status: 501 });
+	}
+	directCache.set(key, { at: Date.now(), url });
+	return url;
+}
+async function handleYtStream(ytPath, cookieName, req, res) {
+	const parsed = parseYtPath(ytPath);
+	if (!parsed) return json(res, 400, { ok: false, error: "bad yt path" });
+	let cookieHdr = "";
+	let watchHost = "";
+	try { watchHost = new URL(parsed.watch).hostname; } catch { watchHost = ""; }
+	try { cookieHdr = cookieName ? await readCookieHeader(cookieName, watchHost) : ""; } catch { cookieHdr = ""; }
+	const key = parsed.watch + "\u0000" + (cookieName || "");
+	/* 已缓存 → 直接本地 Range 流（秒开，不再请求在线源） */
+	if (existsSync(cacheTarget(parsed.watch, cookieName).target)) {
+		return streamLocalFile(cacheTarget(parsed.watch, cookieName).target, req, res);
+	}
+	let upstream = null;
+	for (let attempt = 0; attempt < 2 && !upstream; attempt++) {
+		let direct;
+		try {
+			direct = await resolveDirectUrl(parsed.watch, cookieName);
+		} catch (e) {
+			if (attempt === 1) return streamCachedVideo(parsed.watch, cookieName, req, res);
+			directCache.delete(key);
+			continue;
+		}
+		const headers = { "user-agent": UA };
+		try { headers.referer = new URL(parsed.watch).origin; } catch { /* ignore */ }
+		if (cookieHdr) headers.cookie = cookieHdr;
+		const range = req.headers.range;
+		if (range) headers.range = range;
+		try {
+			upstream = await fetch(direct, { headers, redirect: "follow" });
+		} catch (e) {
+			directCache.delete(key);
+			if (attempt === 1) return json(res, 502, { ok: false, error: "连接视频源失败：" + e.message });
+			continue;
+		}
+		if (upstream.status === 403 || upstream.status === 404 || upstream.status === 410) {
+			Promise.resolve(upstream.body.cancel()).catch(() => {});
+			upstream = null;
+			directCache.delete(key);
+		}
+	}
+	if (!upstream) return streamCachedVideo(parsed.watch, cookieName, req, res);
+	const headers = { "cache-control": "no-store" };
+	for (const k of ["content-type", "content-length", "content-range"]) {
+		const v = upstream.headers.get(k);
+		if (v) headers[k] = v;
+	}
+	headers["accept-ranges"] = "bytes";
+	res.writeHead(upstream.status, headers);
+	if (req.method === "HEAD") {
+		res.end();
+		return;
+	}
+	const body = Readable.fromWeb(upstream.body);
+	req.on("close", () => {
+		try { body.destroy(); } catch { /* ignore */ }
+		/* cancel() 在已锁定的流上会异步 reject，必须吞掉，否则未处理 rejection 会崩进程 */
+		Promise.resolve(upstream.body.cancel()).catch(() => {});
+	});
+	body.pipe(res);
 }
 
-/** GET /video-player/list?dir= — 目录浏览 + 递归视频清单。 */
-async function handleList(url, res) {
-	const rawDir = queryParam(url, "dir");
-	if (!rawDir) return json(res, 400, { ok: false, error: "missing ?dir=" });
-	let dir;
+/* 缓存下载模式：DASH/HLS 等无法单文件直连的流（bilibili 全 DASH）→ yt-dlp 下载合并
+ * 为本地 mp4（≤1080p，同一视频只下一次，并发单飞），之后走本地 Range 流播放。
+ * 需要 ffmpeg（PATH 或本机 config.json 的 "ffmpeg" 字段）。 */
+const CACHE_DIR = join(homedir(), ".dsh", "video-player", "cache");
+const CACHE_MAXH = 1080;
+const dlJobs = new Map();
+function djb2(str) {
+	let h = 5381;
+	for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) >>> 0;
+	return h.toString(36);
+}
+function cacheTarget(watch, cookieName) {
+	let host = "misc";
+	try { host = new URL(watch).hostname.replace(/[^a-z0-9.-]/gi, "_"); } catch { /* misc */ }
+	const id = djb2(watch + "|" + (cookieName || ""));
+	const dir = join(CACHE_DIR, host);
+	return { dir, id, target: join(dir, id + ".mp4") };
+}
+async function downloadToCache(watch, cookieName) {
+	const { dir, id, target } = cacheTarget(watch, cookieName);
+	if (existsSync(target)) return target;
+	const jobKey = dir + "/" + id;
+	const doing = dlJobs.get(jobKey);
+	if (doing) return doing;
+	const job = (async () => {
+		await mkdir(dir, { recursive: true });
+		let cookieArg = [];
+		if (cookieName) {
+			try { cookieArg = ["--cookies", await cookiePath(cookieName)]; } catch { cookieArg = []; }
+		}
+		await runYtdlp([
+			"-f", "b[height<=" + CACHE_MAXH + "]/bv*[height<=" + CACHE_MAXH + "]+ba/b",
+			"--merge-output-format", "mp4",
+			...cookieArg,
+			"--no-playlist", "--no-warnings", "--ignore-config",
+			"-o", join(dir, id + ".%(ext)s"),
+			watch
+		], 15 * 60 * 1000);
+		if (!existsSync(target)) {
+			/* 扩展名不一致（如 webm 源未合并）→ 按 id 前缀查找 */
+			const found = (await readdir(dir)).find((n) => n.startsWith(id + "."));
+			if (!found) throw Object.assign(new Error("下载完成但未找到输出文件"), { status: 502 });
+			return join(dir, found);
+		}
+		return target;
+	})().finally(() => dlJobs.delete(jobKey));
+	dlJobs.set(jobKey, job);
+	return job;
+}
+async function streamCachedVideo(watch, cookieName, req, res) {
+	let file;
 	try {
-		dir = resolveLocalPath(rawDir);
+		file = await downloadToCache(watch, cookieName);
 	} catch (e) {
-		return json(res, e.status || 400, { ok: false, error: e.message });
+		return json(res, e.status || 502, { ok: false, error: "在线视频下载失败（DASH/HLS 转本地缓存播放）：" + String(e.message || e).slice(0, 200) });
 	}
-	let st;
-	try {
-		st = await stat(dir);
-	} catch (err) {
-		if (err && SMB_GONE_CODES.has(err.code))
-			return json(res, 500, { ok: false, error: "目录不可访问（" + smbGoneMsg + "）" });
-		return json(res, 404, { ok: false, error: "directory not found" });
-	}
-	if (!st.isDirectory()) return json(res, 400, { ok: false, error: "not a directory" });
-	const base = dir.replace(/[\\/]+$/, "");
-	const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
-	const dirs = [];
-	for (const e of entries) {
-		if (e.isDirectory()) dirs.push({ name: e.name, path: join(base, e.name) });
-	}
-	dirs.sort(byName);
-	const videos = [];
-	await collectVideos(base, 0, videos);
-	videos.sort(byName);
-	return json(res, 200, { ok: true, dir: base, parent: dirname(base), dirs, videos });
+	return streamLocalFile(file, req, res);
 }
 
-/** GET /video-player/stream?path= — 视频字节流，支持 Range（206）。 */
-function handleStream(url, req, res) {
-	const rawP = queryParam(url, "path");
-	if (!rawP) {
-		json(res, 400, { ok: false, error: "missing ?path=" });
-		return;
-	}
-	let p;
-	try {
-		p = resolveLocalPath(rawP);
-	} catch (e) {
-		json(res, e.status || 400, { ok: false, error: e.message });
-		return;
-	}
-	if (!isVideo(basename(p))) {
-		json(res, 400, { ok: false, error: "not a video file" });
-		return;
-	}
+/** 本地文件 Range 流（200/206/416 + SMB 断连提示）——本地目录与在线缓存共用。 */
+function streamLocalFile(p, req, res) {
 	stat(p).then((st) => {
 		if (!st.isFile()) {
 			throw Object.assign(new Error("not a regular file"), { status: 400 });
@@ -318,6 +586,138 @@ function handleStream(url, req, res) {
 	});
 }
 
+/* cookies 管理端点：GET 列表 / POST 上传 / DELETE 删除 */
+function readBody(req, limit) {
+	return new Promise((resolve, reject) => {
+		const chunks = [];
+		let size = 0;
+		req.on("data", (c) => {
+			size += c.length;
+			if (size > limit) {
+				reject(Object.assign(new Error("body too large"), { status: 413 }));
+				req.destroy();
+				return;
+			}
+			chunks.push(c);
+		});
+		req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+		req.on("error", reject);
+	});
+}
+async function handleCookies(req, url, res) {
+	try {
+		if (req.method === "GET") return json(res, 200, { ok: true, cookies: await listCookies() });
+		if (req.method === "DELETE") {
+			const name = queryParam(url, "name");
+			if (!name) return json(res, 400, { ok: false, error: "missing ?name=" });
+			await deleteCookie(name);
+			return json(res, 200, { ok: true });
+		}
+		const body = JSON.parse(await readBody(req, 5 * 1024 * 1024));
+		await saveCookie(String(body.name || ""), String(body.data || ""));
+		return json(res, 200, { ok: true, name: body.name });
+	} catch (e) {
+		return json(res, e.status || 500, { ok: false, error: e.message || String(e) });
+	}
+}
+
+function json(res, code, body) {
+	res.writeHead(code, {
+		"content-type": "application/json; charset=utf-8",
+		"cache-control": "no-cache"
+	});
+	res.end(JSON.stringify(body));
+}
+
+function queryParam(url, key) {
+	const raw = url.searchParams.get(key);
+	try {
+		return raw === null ? "" : decodeURIComponent(raw);
+	} catch {
+		return "";
+	}
+}
+
+/** 递归收集视频文件（数量/深度上限保护），跳过不可读条目。 */
+async function collectVideos(dir, depth, acc) {
+	if (acc.length >= MAX_FILES || depth > MAX_DEPTH) return;
+	let entries;
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const e of entries) {
+		if (acc.length >= MAX_FILES) break;
+		const full = join(dir, e.name);
+		try {
+			if (e.isDirectory()) {
+				await collectVideos(full, depth + 1, acc);
+			} else if (e.isFile() && isVideo(e.name)) {
+				const st = await stat(full);
+				acc.push({ name: e.name, path: full, size: st.size, mtimeMs: st.mtimeMs });
+			}
+		} catch {
+			/* 跳过无法读取的条目 */
+		}
+	}
+}
+
+/** GET /video-player/list?dir= — 目录浏览 + 递归视频清单。 */
+async function handleList(url, res) {
+	const rawDir = queryParam(url, "dir");
+	if (!rawDir) return json(res, 400, { ok: false, error: "missing ?dir=" });
+	if (isRemoteDir(rawDir)) return handleRemoteList(rawDir, queryParam(url, "cookie"), res);
+	let dir;
+	try {
+		dir = resolveLocalPath(rawDir);
+	} catch (e) {
+		return json(res, e.status || 400, { ok: false, error: e.message });
+	}
+	let st;
+	try {
+		st = await stat(dir);
+	} catch (err) {
+		if (err && SMB_GONE_CODES.has(err.code))
+			return json(res, 500, { ok: false, error: "目录不可访问（" + smbGoneMsg + "）" });
+		return json(res, 404, { ok: false, error: "directory not found" });
+	}
+	if (!st.isDirectory()) return json(res, 400, { ok: false, error: "not a directory" });
+	const base = dir.replace(/[\\/]+$/, "");
+	const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
+	const dirs = [];
+	for (const e of entries) {
+		if (e.isDirectory()) dirs.push({ name: e.name, path: join(base, e.name) });
+	}
+	dirs.sort(byName);
+	const videos = [];
+	await collectVideos(base, 0, videos);
+	videos.sort(byName);
+	return json(res, 200, { ok: true, dir: base, parent: dirname(base), dirs, videos });
+}
+
+/** GET /video-player/stream?path= — 视频字节流，支持 Range（206）。 */
+function handleStream(url, req, res) {
+	const rawP = queryParam(url, "path");
+	if (!rawP) {
+		json(res, 400, { ok: false, error: "missing ?path=" });
+		return;
+	}
+	if (rawP.startsWith("yt|")) return handleYtStream(rawP, queryParam(url, "cookie"), req, res);
+	let p;
+	try {
+		p = resolveLocalPath(rawP);
+	} catch (e) {
+		json(res, e.status || 400, { ok: false, error: e.message });
+		return;
+	}
+	if (!isVideo(basename(p))) {
+		json(res, 400, { ok: false, error: "not a video file" });
+		return;
+	}
+	streamLocalFile(p, req, res);
+}
+
 /**
  * 宿主插件体：挂载 `/video-player` 前缀路由，fiber 卸载时自动摘除。
  * @param ctx - 宿主 context（注入 webServer 服务）。
@@ -328,11 +728,14 @@ function apply(ctx) {
 		path: "/video-player",
 		handler: (req, res) => {
 			const url = new URL(req.url ?? "/", "http://x");
-			if (req.method !== "GET" && req.method !== "HEAD") {
+			const isCookies = url.pathname === "/video-player/cookies";
+			const okMethods = isCookies ? ["GET", "POST", "DELETE"] : ["GET", "HEAD"];
+			if (!okMethods.includes(req.method)) {
 				return json(res, 405, { ok: false, error: "method not allowed" });
 			}
 			if (url.pathname === "/video-player/list") return handleList(url, res);
 			if (url.pathname === "/video-player/stream") return handleStream(url, req, res);
+			if (isCookies) return handleCookies(req, url, res);
 			return json(res, 404, { ok: false, error: "unknown endpoint" });
 		}
 	});
@@ -341,6 +744,6 @@ function apply(ctx) {
 const inject = ["webServer"];
 
 /* 仅供测试：SMB 地址解析的纯函数。 */
-const _test = { parseSmbUrl, findSmbMount, resolveSmbLocal, smbUrlToUnc, normalizeUnc };
+const _test = { parseSmbUrl, findSmbMount, resolveSmbLocal, smbUrlToUnc, normalizeUnc, parseCookiesHeader, makeYtPath, isRemoteDir, parseYtPath };
 
 export { apply, inject, _test };
