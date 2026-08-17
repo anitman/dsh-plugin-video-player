@@ -310,6 +310,29 @@ async function runYtdlp(args, timeoutMs) {
 	return ytdlpExec(c.cmd, [...c.args, ...(ff ? ["--ffmpeg-location", ff] : []), "--user-agent", UA, ...args], timeoutMs);
 }
 
+/** yt-dlp JSON 抽取：先不带 cookie，失败且选了 cookie 时带 cookie 重试。
+ * （整浏览器导出的 cookies.txt 含跨站会话 cookie，直接带上前端站点会风控。） */
+async function extractJson(args, cookieName, timeoutMs) {
+	try {
+		return JSON.parse(await runYtdlp(args, timeoutMs));
+	} catch (e) {
+		if (!cookieName) throw e;
+		const p = await cookiePath(cookieName).catch(() => null);
+		if (!p) throw e;
+		return JSON.parse(await runYtdlp([...args, "--cookies", p], timeoutMs));
+	}
+}
+
+/** YouTube 风控类错误 → 截断并附中文提示 */
+function hintYt(msg) {
+	const t = String(msg || "");
+	if (/not a bot|Sign in to confirm/i.test(t)) {
+		return t.split("
+")[0].slice(0, 120) + "；（YouTube 正在风控当前网络/IP：稍后重试；或用已登录 YouTube 的浏览器重新导出该站 cookies.txt，在 🍪 行上传后再试）";
+	}
+	return t;
+}
+
 /* 远程列表：网址 → yt-dlp flat-playlist → 与本地目录同构的 videos 数组 */
 function isRemoteDir(raw) {
 	return /^https?:\/\//i.test(raw) || /^(bilibili|youtube|twitter|x|vimeo|tiktok):/i.test(raw);
@@ -333,17 +356,12 @@ async function handleRemoteList(rawDir, cookieName, res) {
 	const now = Date.now();
 	const hit = remoteCache.get(key);
 	if (hit && now - hit.at < REMOTE_TTL) return json(res, 200, { ok: true, ...hit.data });
-	const args = ["-J", "--flat-playlist", "--no-warnings", "--ignore-config"];
-	if (cookieName) {
-		try { args.push("--cookies", await cookiePath(cookieName)); }
-		catch (e) { return json(res, e.status || 400, { ok: false, error: e.message }); }
-	}
-	args.push(rawDir);
+	const args = ["-J", "--flat-playlist", "--no-warnings", "--ignore-config", rawDir];
 	let data;
 	try {
-		data = JSON.parse(await runYtdlp(args, 45000));
+		data = await extractJson(args, cookieName, 45000);
 	} catch (e) {
-		return json(res, 502, { ok: false, error: "yt-dlp 获取列表失败：" + e.message });
+		return json(res, 502, { ok: false, error: "yt-dlp 获取列表失败：" + hintYt(e.message) });
 	}
 	const entries = Array.isArray(data.entries) ? data.entries : [data];
 	const videos = entries.filter((e) => e && (e.id || e.url)).slice(0, MAX_FILES).map((e) => ({
@@ -357,7 +375,16 @@ async function handleRemoteList(rawDir, cookieName, res) {
 }
 
 /* 直连地址解析 + 代理转发（Range 透传；403/404/410 刷新地址重试一次） */
+/** 直连地址解析：先匿名（避免陈旧 cookie 触发风控），失败再带 cookie 重试。 */
 async function resolveDirectUrl(watch, cookieName) {
+	try {
+		return await resolveDirectUrlOnce(watch, null);
+	} catch (e) {
+		if (!cookieName) throw e;
+		return resolveDirectUrlOnce(watch, cookieName);
+	}
+}
+async function resolveDirectUrlOnce(watch, cookieName) {
 	const key = watch + "\u0000" + (cookieName || "");
 	const hit = directCache.get(key);
 	if (hit && Date.now() - hit.at < REMOTE_TTL) return hit.url;
@@ -495,14 +522,19 @@ async function downloadToCache(watch, cookieName) {
 		if (cookieName) {
 			try { cookieArg = ["--cookies", await cookiePath(cookieName)]; } catch { cookieArg = []; }
 		}
-		await runYtdlp([
+		const rest = [
 			"-f", "b[height<=" + CACHE_MAXH + "]/bv*[height<=" + CACHE_MAXH + "]+ba/b",
 			"--merge-output-format", "mp4",
-			...cookieArg,
 			"--no-playlist", "--no-warnings", "--ignore-config",
 			"-o", join(dir, id + ".%(ext)s"),
 			watch
-		], 15 * 60 * 1000);
+		];
+		try {
+			await runYtdlp(rest, 15 * 60 * 1000);
+		} catch (e) {
+			if (!cookieArg.length) throw e;
+			await runYtdlp([...rest, ...cookieArg], 15 * 60 * 1000); // 匿名失败 → 带 cookie 重试
+		}
 		if (!existsSync(target)) {
 			/* 扩展名不一致（如 webm 源未合并）→ 按 id 前缀查找 */
 			const found = (await readdir(dir)).find((n) => n.startsWith(id + "."));
@@ -519,7 +551,7 @@ async function streamCachedVideo(watch, cookieName, req, res) {
 	try {
 		file = await downloadToCache(watch, cookieName);
 	} catch (e) {
-		return json(res, e.status || 502, { ok: false, error: "在线视频下载失败（DASH/HLS 转本地缓存播放）：" + String(e.message || e).slice(0, 200) });
+		return json(res, e.status || 502, { ok: false, error: "在线视频下载失败（DASH/HLS 转本地缓存播放）：" + hintYt(e.message).slice(0, 300) });
 	}
 	return streamLocalFile(file, req, res);
 }
