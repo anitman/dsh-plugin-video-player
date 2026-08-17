@@ -14,9 +14,11 @@
  *   - 可访问路径 = 本机 shell 可读范围（GUI 默认绑定 127.0.0.1）。
  *
  * SMB:// NAS 支持：
- *   - 共享已挂载（Finder ⌘K / mount_smbfs）时，直接填挂载点路径即可；
- *   - 也可直接填 smb://host/共享/子目录 或 \\host\共享\子目录，
- *     宿主解析 `mount` 输出换算成本地挂载路径（凭据由系统挂载时处理，不经过本插件）。
+ *   - Windows：\\host\共享\子目录（UNC）由系统 SMB 客户端直读，无需映射盘符；
+ *     smb://[user@]host/共享/子目录 自动换算成 UNC 后直读；
+ *   - macOS/Linux：共享已挂载（Finder ⌘K / mount_smbfs / mount -t cifs）时
+ *     直接填挂载点路径即可；填 smb:// 或 \\UNC 时宿主解析 `mount` 输出
+ *     换算成本地挂载路径（凭据由系统挂载时处理，不经过本插件）。
  */
 import { createReadStream } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
@@ -39,15 +41,23 @@ const MIME = {
 const isVideo = (name) => VIDEO_EXTS.has(extname(name).toLowerCase());
 const byName = (a, b) => a.name.localeCompare(b.name, "zh-Hans-CN", { numeric: true, sensitivity: "base" });
 
-/* ── SMB:// NAS 路径支持 ──
- * 插件经本机文件系统读文件：SMB 共享只要挂载在本机（Finder ⌘K / mount_smbfs），
- * 填挂载点路径即可直接浏览/播放。额外支持直接填
- *   smb://[user@]host/共享名/子目录  或  \\host\共享名\子目录
- * 宿主解析 `mount` 输出找到对应挂载点并换算成本地路径。
- * 凭据不经过本插件——挂载时由系统（Finder/mount_smbfs）完成认证。 */
+/* ── SMB / 网络共享路径支持 ──
+ * 插件经本机文件系统读文件。
+ *   Windows：\\host\共享名\子目录（UNC）由系统 SMB 客户端直接读取，无需映射盘符；
+ *            smb://[user@]host/共享名/子目录 换算成 UNC 后直读。
+ *   macOS/Linux：SMB 共享挂载在本机（Finder ⌘K / mount_smbfs / mount -t cifs）时
+ *            填挂载点路径即可直接浏览/播放；填 smb:// 或 \\UNC 时宿主解析
+ *            `mount` 输出找到对应挂载点并换算成本地路径。
+ * 凭据不经过本插件——由系统（SMB 客户端 / 挂载）完成认证。 */
 const smbHttp = (msg) => Object.assign(new Error(msg), { status: 400 });
-// SMB/网络卷断开后常见的读错误码
-const SMB_GONE_CODES = new Set(["EIO", "ESTALE", "ENXIO", "ENETDOWN", "EHOSTDOWN"]);
+// SMB/网络卷断开后常见的读错误码（macOS/Linux + Windows SMB 客户端）
+const SMB_GONE_CODES = new Set([
+	"EIO", "ESTALE", "ENXIO", "ENETDOWN", "EHOSTDOWN",
+	"ECONNRESET", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "EPIPE"
+]);
+const smbGoneMsg = process.platform === "win32"
+	? "网络共享不可访问（NAS 可能已离线或共享被断开，请检查连接后重试）"
+	: "SMB 挂载不可访问（挂载可能已断开，请重新挂载后再试）";
 
 function parseSmbUrl(url) {
 	let u;
@@ -125,11 +135,34 @@ function getMountText() {
 	return mountCache.text;
 }
 
-/** 解析输入路径：smb:// 与 \\UNC 换算成本地挂载路径，其余原样透传（错误带 status）。 */
+/** smb://[user@]host/共享名/子目录 → \\host\共享名\子目录（Windows 系统 SMB 客户端直读）。 */
+function smbUrlToUnc(url) {
+	const { host, share, sub } = parseSmbUrl(url);
+	const segs = [host, share, ...sub];
+	return "\\\\" + segs.filter(Boolean).map((s) => String(s).replace(/\//g, "\\")).join("\\");
+}
+
+/** 归一化 UNC 输入：保留开头的 \\\\，合并路径中多余反斜杠、去掉结尾反斜杠
+ *  （\\\\host\\share\ → \\\\host\share；\\\\Kenny_cloud\video\子目录 原样可用）。 */
+function normalizeUnc(unc) {
+	const noTail = unc.replace(/\\+$/, "");
+	if (!/^\\\\/.test(noTail)) return noTail;
+	return "\\\\" + noTail.slice(2).replace(/\\{2,}/g, "\\");
+}
+
+/** 解析输入路径，其余原样透传（错误带 status）：
+ *  - Windows：smb:// 换算成 UNC；\\UNC 归一化后由系统 SMB 客户端直读；
+ *  - macOS/Linux：smb:// 与 \\UNC 解析 `mount` 输出换算成本地挂载路径。 */
 function resolveLocalPath(input) {
 	const raw = (input || "").trim();
-	if (/^smb:\/\//i.test(raw)) return resolveSmbLocal(raw, getMountText());
-	if (/^\\\\/.test(raw)) return resolveSmbLocal("smb:" + raw.replace(/\\/g, "/"), getMountText());
+	if (/^smb:\/\//i.test(raw)) {
+		if (process.platform === "win32") return smbUrlToUnc(raw);
+		return resolveSmbLocal(raw, getMountText());
+	}
+	if (/^\\\\/.test(raw)) {
+		if (process.platform === "win32") return normalizeUnc(raw);
+		return resolveSmbLocal("smb:" + raw.replace(/\\/g, "/"), getMountText());
+	}
 	return raw;
 }
 
@@ -190,7 +223,7 @@ async function handleList(url, res) {
 		st = await stat(dir);
 	} catch (err) {
 		if (err && SMB_GONE_CODES.has(err.code))
-			return json(res, 500, { ok: false, error: "目录不可访问（SMB 挂载可能已断开，请重新挂载后再试）" });
+			return json(res, 500, { ok: false, error: "目录不可访问（" + smbGoneMsg + "）" });
 		return json(res, 404, { ok: false, error: "directory not found" });
 	}
 	if (!st.isDirectory()) return json(res, 400, { ok: false, error: "not a directory" });
@@ -273,7 +306,7 @@ function handleStream(url, req, res) {
 			return;
 		}
 		if (error && error.code && SMB_GONE_CODES.has(error.code)) {
-			return json(res, 500, { ok: false, error: "读取失败（SMB 挂载可能已断开，请重新挂载后再试）" });
+			return json(res, 500, { ok: false, error: "读取失败（" + smbGoneMsg + "）" });
 		}
 		const status = error && error.status ? error.status : error && error.code === "ENOENT" ? 404 : 500;
 		if (status === 416) {
@@ -308,6 +341,6 @@ function apply(ctx) {
 const inject = ["webServer"];
 
 /* 仅供测试：SMB 地址解析的纯函数。 */
-const _test = { parseSmbUrl, findSmbMount, resolveSmbLocal };
+const _test = { parseSmbUrl, findSmbMount, resolveSmbLocal, smbUrlToUnc, normalizeUnc };
 
 export { apply, inject, _test };

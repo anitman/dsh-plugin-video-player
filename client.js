@@ -28,6 +28,8 @@ window.__ModuleLoader__.load({
 		let reactDom = require("react-dom");
 		const { useState, useEffect, useRef, useCallback } = react;
 		const { jsx, jsxs, Fragment } = jsxrt;
+		/* 路径提示按平台区分：Windows 用 \\主机\共享（UNC），其他平台用 smb://主机/共享 */
+		const isWin = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent || "");
 
 		/* ── 样式（按 data-plugin 约定注入，HMR 重载时由宿主按 data-plugin 清除） ── */
 		const css = [
@@ -221,7 +223,9 @@ window.__ModuleLoader__.load({
 			const cardSub = el("div", "vdpv-card-sub");
 			const browseWrap = el("div", "vdpv-browse");
 			const input = el("input", "vdpv-input");
-			input.placeholder = "文件夹绝对路径 或 smb://主机/共享，回车浏览";
+			input.placeholder = isWin
+				? "文件夹路径，如 \\192.168.1.100\\视频 或 smb://主机/共享，回车浏览"
+				: "文件夹绝对路径 或 smb://主机/共享，回车浏览";
 			const rows = el("div", "vdpv-rows");
 			const playBtn = el("button", "vdpv-playbtn");
 			playBtn.type = "button";
@@ -273,7 +277,10 @@ window.__ModuleLoader__.load({
 			function welcome() {
 				setCard(
 					"📺 刷视频",
-					"输入本地文件夹绝对路径，或 smb://主机/共享（NAS 需先挂载）。\n↑↓ / 拖拽 切换 · ←→ 快进 · 空格 暂停 · M 静音",
+					(/Windows/i.test(navigator.userAgent || "")
+					? "输入文件夹路径，如 \\192.168.1.100\\共享（UNC 直读 NAS）。\n"
+					: "输入本地文件夹绝对路径，或 smb://主机/共享（NAS 需先挂载）。\n") +
+					"↑↓ / 拖拽 切换 · ←→ 快进 · 空格 暂停 · M 静音",
 					true
 				);
 				input.value = "";
