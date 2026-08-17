@@ -4,6 +4,24 @@
 	"private": true,
 	"type": "module",
 	"description": "DSH web GUI 客户端插件：刷视频窗口（选文件夹 / 抖音式竖屏刷视频 / ←→ 快进 / ↑↓ 或拖拽切换）",
+	"license": "MIT",
+	"author": "anitman",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/anitman/dsh-plugin-video-player.git"
+	},
+	"homepage": "https://github.com/anitman/dsh-plugin-video-player#readme",
+	"keywords": [
+		"deepseek",
+		"harness",
+		"dsh",
+		"dsh-plugin",
+		"video",
+		"player",
+		"streaming",
+		"smb",
+		"nas"
+	],
 	"main": "index.js",
 	"exports": {
 		".": "./index.js",
