@@ -62,7 +62,7 @@ npx @deepseek-ai/dsh web
 Install this plugin into a profile (the ecosystem convention):
 
 ```sh
-dsh plugin --profile web add "github:anitman/dsh-plugin-video-player#ref"
+dsh plugin --profile web add "github:anitman/dsh-plugin-video-player#main"
 ```
 
 `dsh plugin` forwards package operations to pnpm, so npm, Git/GitHub, local path, `file:` and `link:` package specs are all supported — e.g. from a local clone:
