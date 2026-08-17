@@ -859,7 +859,7 @@ window.__ModuleLoader__.load({
 					},
 					// 回到浏览/欢迎视图：窗口恢复初始默认尺寸（避免小视频适配尺寸挡住按钮）
 					onBrowse: () => {
-						metaIdxRef.current = -1;
+						lastFitVideoRef.current = -1;
 						setSize(null);
 						setMeta(null);
 						autoFitRef.current = true;
