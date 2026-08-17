@@ -70,6 +70,8 @@ window.__ModuleLoader__.load({
 			".vdpv-topbar .vdpv-spacer{flex:1}",
 			".vdpv-tbtn{flex:none;background:rgba(255,255,255,.14);color:#fff;border:0;border-radius:7px;padding:4px 9px;font:inherit;font-size:11px;cursor:pointer}",
 			".vdpv-tbtn:hover{background:rgba(255,255,255,.25)}",
+			".vdpv-tbtn.active{background:rgba(255,59,92,.5)}",
+			".vdpv-tbtn.active:hover{background:rgba(255,59,92,.65)}",
 			".vdpv-bottombar{position:absolute;left:0;right:0;bottom:0;z-index:10;padding:24px 12px 8px;display:flex;flex-direction:column;gap:5px;background:linear-gradient(transparent,rgba(0,0,0,.78));transition:opacity .18s ease}",
 			".vdpv-brow{gap:8px;align-items:center;display:flex;font-size:12px}",
 			".vdpv-counter{flex:none;opacity:.8;font-size:11px}",
@@ -174,6 +176,14 @@ window.__ModuleLoader__.load({
 				/* ignore */
 			}
 		}
+		/* 循环播放开关（持久化：重开窗口仍记住选择） */
+		const LOOP_KEY = "vdpv.loop.v1";
+		function readLoop() {
+			try { return localStorage.getItem(LOOP_KEY) === "1"; } catch { return false; }
+		}
+		function persistLoop(v) {
+			try { localStorage.setItem(LOOP_KEY, v ? "1" : "0"); } catch { /* ignore */ }
+		}
 
 		/* ── 播放引擎（命令式 DOM；切换/拖拽/快进逻辑与独立验证过的版本一致） ── */
 		const SEEK_STEP = 5;
@@ -193,8 +203,12 @@ window.__ModuleLoader__.load({
 			const browseBtn = el("button", "vdpv-tbtn");
 			browseBtn.type = "button";
 			browseBtn.textContent = "更换文件夹";
+			const loopBtn = el("button", "vdpv-tbtn");
+			loopBtn.type = "button";
+			loopBtn.textContent = "🔁 循环";
+			loopBtn.title = "循环播放当前视频（关闭则播完自动切下一个）";
 			const topSpacer = el("span", "vdpv-spacer");
-			topbar.append(folderName, topSpacer, browseBtn);
+			topbar.append(folderName, topSpacer, loopBtn, browseBtn);
 
 			const chip = el("button", "vdpv-chip");
 			chip.type = "button";
@@ -251,6 +265,7 @@ window.__ModuleLoader__.load({
 			let scrollRaf = 0;
 			let lastMeta = null; // 当前视频原生尺寸 { w, h }
 			let settleIdx = -1; // 滚动正在停靠/已停靠的视频索引（-1 = 无目标，如浏览视图）
+			let loop = readLoop(); // 循环播放：播完重播当前视频（默认关闭=自动切下一个）
 			const styled = new Set();
 
 			/* ── 卡片 / 浏览视图 ── */
@@ -392,14 +407,14 @@ window.__ModuleLoader__.load({
 						videos[k].meta = { w: vw, h: vh };
 						if (idx === k && !disposed) {
 							lastMeta = videos[k].meta;
-							onFit(vw, vh);
+							onFit(vw, vh, k);
 						}
 					});
 					// 上报原生尺寸：窗口自动匹配视频宽高比（默认 1/4 大小）
 					video.addEventListener("loadedmetadata", () => {
 						if (idx === k && video.videoWidth && video.videoHeight) {
 							lastMeta = { w: video.videoWidth, h: video.videoHeight };
-							if (onFit) onFit(video.videoWidth, video.videoHeight);
+							if (onFit) onFit(video.videoWidth, video.videoHeight, k);
 						}
 					});
 					slide.appendChild(video);
@@ -467,7 +482,7 @@ window.__ModuleLoader__.load({
 				const m = videos[i].meta;
 				if (m) {
 					lastMeta = m;
-					onFit(m.w, m.h);
+					onFit(m.w, m.h, i);
 				}
 			}
 
@@ -527,6 +542,14 @@ window.__ModuleLoader__.load({
 			});
 
 			function onEnded() {
+				if (loop) {
+					const v = videos[idx];
+					if (v && v.video.getAttribute("src")) {
+						v.video.currentTime = 0;
+						playVideo(v);
+					}
+					return;
+				}
 				if (idx < videos.length - 1) goTo(idx + 1);
 				else endCard.hidden = false;
 			}
@@ -541,6 +564,21 @@ window.__ModuleLoader__.load({
 				v.video.play().catch(() => {}); // 静音后重试一次
 			}
 			chip.addEventListener("click", toggleMute);
+
+			/* 循环开关：🔁 播放完重播当前视频 ↔ 自动切下一个视频 */
+			function applyLoopUI() {
+				loopBtn.classList.toggle("active", loop);
+				loopBtn.title = loop
+					? "循环播放已开启：播完重播当前视频（点击切换为自动切视频）"
+					: "自动切视频已开启：播完播下一个（点击开启循环播放）";
+			}
+			loopBtn.addEventListener("click", () => {
+				loop = !loop;
+				applyLoopUI();
+				persistLoop(loop);
+				flash(loop ? "🔁 循环播放：播完重播当前视频" : "自动切视频：播完播下一个", true);
+			});
+			applyLoopUI();
 
 			/* ── 快进 / 暂停 / 静音 / 提示 ── */
 			function flash(text, small) {
@@ -751,7 +789,7 @@ window.__ModuleLoader__.load({
 				dispose,
 				// 双击标题栏恢复自动适配时，重新按已知尺寸适配一次
 				refit: () => {
-					if (lastMeta && !disposed) onFit(lastMeta.w, lastMeta.h);
+					if (lastMeta && !disposed) onFit(lastMeta.w, lastMeta.h, idx);
 				}
 			};
 		}
@@ -766,6 +804,7 @@ window.__ModuleLoader__.load({
 			const engineRef = useRef(null);
 			const dragRef = useRef(null);
 			const resizeRef = useRef(null);
+			const lastFitVideoRef = useRef(-1); // 上次 onFit 的视频索引（切到新视频→按宽高比重置窗口）
 
 			// 恢复会话记忆：位置 + 手动尺寸（fit=false 时）
 			const initRef = useRef(null);
@@ -806,7 +845,15 @@ window.__ModuleLoader__.load({
 						if (titleRef.current) titleRef.current.textContent = text || "";
 					},
 					onClose,
-					onFit: (w, h) => setMeta({ w, h }), // autoFit 时 eff 随 meta 自动重算
+					onFit: (w, h, videoIndex) => {
+						// 切到新视频：窗口按新视频宽高比重新适配（清掉上一条视频遗留的手动尺寸）
+						if (videoIndex !== lastFitVideoRef.current) {
+							lastFitVideoRef.current = videoIndex;
+							setSize(null);
+							autoFitRef.current = true;
+						}
+						setMeta({ w, h });
+					},
 					onToggleFullscreen: toggleFullscreen
 				});
 				engineRef.current = engine;
