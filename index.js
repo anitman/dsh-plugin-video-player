@@ -307,7 +307,12 @@ async function runYtdlp(args, timeoutMs) {
 	const c = await ytdlpCmd();
 	const ff = await ffmpegLocation();
 	/* 浏览器 UA：bilibili 等站对 yt-dlp 默认 UA 有 352/412 风控 */
-	return ytdlpExec(c.cmd, [...c.args, ...(ff ? ["--ffmpeg-location", ff] : []), "--user-agent", UA, ...args], timeoutMs);
+	/* extractorArgs（本机配置）：追加 --extractor-args，如 "generic:impersonate"
+	 * （Cloudflare 反爬站点的 TLS 浏览器指纹伪装；需要 yt-dlp 环境装了 curl_cffi） */
+	const cfg = JSON.parse(await readFile(LOCAL_CONFIG, "utf8").catch(() => "{}"));
+	const extra = Array.isArray(cfg.extractorArgs) ? cfg.extractorArgs : typeof cfg.extractorArgs === "string" && cfg.extractorArgs.trim() ? [cfg.extractorArgs] : [];
+	const extractorArgs = extra.flatMap((x) => (String(x).trim() ? ["--extractor-args", String(x).trim()] : []));
+	return ytdlpExec(c.cmd, [...c.args, ...(ff ? ["--ffmpeg-location", ff] : []), "--user-agent", UA, ...extractorArgs, ...args], timeoutMs);
 }
 
 /** yt-dlp JSON 抽取：先不带 cookie，失败且选了 cookie 时带 cookie 重试。
