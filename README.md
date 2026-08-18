@@ -34,12 +34,14 @@ A client plugin for the DSH web GUI: adds a "video" button at the bottom of the 
 - **Online videos (yt-dlp)**: paste a yt-dlp-supported video / playlist / uploader URL into the same address bar (bilibili, YouTube, …) — the list is fetched via `--flat-playlist` (in-memory, 30 min); single-file progressive streams are proxied by the host (browser UA + Referer + Cookie, Range passed through); DASH/HLS segment streams (all bilibili) are auto-downloaded and merged to a local mp4 (≤1080p, needs ffmpeg) and then served as a local Range stream — each video downloads once, replays are instant;
 - **Login state (cookies.txt)**: the 🍪 row in the browse card selects / uploads / deletes a browser-exported `cookies.txt` (stored under `~/.dsh/video-player/cookies/`); only non-expired, domain-matching cookies are forwarded (a whole-browser export stays under CDN header limits); needed for high-quality / members-only / login-gated content;
 - **yt-dlp & ffmpeg discovery** (no machine-specific paths in the repo): local config `~/.dsh/video-player/config.json` → `{"ytdlp": "<path>", "ffmpeg": "<path-or-dir>"}` > `DVP_YTDLP` env > PATH (`yt-dlp` / `yt-dlp.exe`) > `python -m yt_dlp`; the first candidate that answers `--version` wins (cached);
+- **Chat push (agent)**: the dsh agent can push a video into the player — `POST /video-player/queue {"url","title"}` (in-memory, 10 items max, 30 min TTL); an open player window polls every 2 s and auto-plays the first pending item (📥 toast); while the window is closed the items wait and play as soon as it opens; the agent can search first with yt-dlp (`bilisearch5:<topic>` / `ytssearch5:<topic>`) and push the pick;
+- **Cache cleanup**: the 🧹 button in the cookie row shows the DASH-merge cache size and clears it with one confirm (`GET/DELETE /video-player/cache`; files locked by active playback are skipped and reported).
 - Memory-friendly: only the current video ± 1 neighbor preload sources; far-away videos release their buffers;
 - Supported formats: mp4 / m4v / webm / ogv / ogg / mov / mkv / avi / flv / ts / mpg / mpeg / 3gp / wmv (decoding depends on Chromium; a codec it can't handle shows a "can't play" card and auto-skips).
 
 ### Security boundaries
 
-- The host half registers only `/video-player`-prefixed routes; **list/stream are GET/HEAD only** — the sole write route is `/video-player/cookies` (POST upload / DELETE), name-validated (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`), 5 MB body cap, stored under `~/.dsh/video-player/cookies/` — nothing else is ever written;
+- The host half registers only `/video-player`-prefixed routes; **list/stream are GET/HEAD only** — write routes: `/video-player/cookies` (POST upload / DELETE, name-validated `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, 5 MB cap, stored under `~/.dsh/video-player/cookies/`), `/video-player/cache` (DELETE, only the plugin's own cache dir), `/video-player/queue` (POST, in-memory push queue — no file or network side effects);
 - File access is limited to the video extension whitelist above, regular files only; Range offsets are validated against file size;
 - Directory listings are capped (2000 files / depth 8); unreadable entries are silently skipped;
 - Accessible paths = whatever the local shell can read (the GUI listens on 127.0.0.1 by default);
@@ -51,7 +53,7 @@ A client plugin for the DSH web GUI: adds a "video" button at the bottom of the 
 | --- | --- |
 | `package.json` | Package manifest + `dsh.bundle` (install layer) + `dsh.client` (browser-half discovery) |
 | `cordis.patch.yml` | Bundle patch layer activated by `dsh plugin add`; registers the `video-player` Loader row |
-| `index.js` | Host half (node): `/video-player/list` (local + yt-dlp remote lists) + `/video-player/stream` (local Range / online proxy / DASH cache download) + `/video-player/cookies` (GET/POST/DELETE), incl. SMB path resolution |
+| `index.js` | Host half (node): `/video-player/list` (local + yt-dlp remote lists) + `/video-player/stream` (local Range / online proxy / DASH cache download) + `/video-player/cookies` (GET/POST/DELETE) + `/video-player/cache` (GET/DELETE) + `/video-player/queue` (GET/POST), incl. SMB path resolution |
 | `client.js` | Browser half (classic script bundle, no build step) |
 
 ### Install
@@ -128,12 +130,14 @@ DSH web GUI 客户端插件：侧栏底部多一个「▶ 刷视频」按钮，�
 - **在线视频（yt-dlp）**：地址栏直接粘贴 yt-dlp 支持的视频/UP主/播放列表网址（bilibili、YouTube 等）——列表内存缓存 30 分钟；单文件渐进流由宿主代理转发（补浏览器 UA/Referer/Cookie，Range 透传）；DASH/HLS 分段流（bilibili 全 DASH）自动下载合并为本地 mp4（≤1080p，需 ffmpeg）再本地 Range 播放，同一视频只下一次、之后秒开；
 - **登录态（cookies.txt）**：浏览卡片里的 🍪 一行可选择/上传/删除浏览器导出的 cookies.txt（存于 `~/.dsh/video-player/cookies/`）；只转发未过期且域匹配的条目（整浏览器导出也不会超 CDN 头限制）；高清/会员/需登录内容必备；
 - **yt-dlp 与 ffmpeg 定位**（仓库不含任何机器特定路径）：本机配置 `~/.dsh/video-player/config.json` → `{"ytdlp": "<路径>", "ffmpeg": "<路径或目录>"}` > 环境变量 `DVP_YTDLP` > PATH（`yt-dlp`/`yt-dlp.exe`）> `python -m yt_dlp`；第一个能通过 `--version` 的候选胜出并缓存；
+- **对话推送（agent）**：dsh agent 可以把视频推进播放器 —— `POST /video-player/queue {"url","title"}`（纯内存，最多 10 条，30 分钟过期）；打开中的播放窗口每 2 秒轮询一次，自动播放第一条待播视频（📥 提示）；窗口没开时视频先排队，开窗即播；agent 可先用 yt-dlp 搜索（`bilisearch5:<话题>` / `ytssearch5:<话题>`）挑一个再推；
+- **缓存清理**：🍪 一行的 🧹 按钮显示 DASH 合并缓存的大小，点一下确认即清空（`GET/DELETE /video-player/cache`；正在播放占用的文件跳过并报告）。
 - 内存友好：只预载当前视频 ±1 个邻位，远离当前视频的自动释放缓冲；
 - 支持格式：mp4 / m4v / webm / ogv / ogg / mov / mkv / avi / flv / ts / mpg / mpeg / 3gp / wmv（能否解码取决于 Chromium，常见编码没问题；不支持的编码会显示「无法播放」卡片并自动跳过）。
 
 ### 安全边界
 
-- 宿主半边只注册 `/video-player` 前缀路由；**list/stream 仅 GET/HEAD**；唯一写入路由是 `/video-player/cookies`（POST 上传 / DELETE 删除）—— 名称白名单校验（`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`）、正文 ≤5MB，只写入 `~/.dsh/video-player/cookies/` 目录；
+- 宿主半边只注册 `/video-player` 前缀路由；**list/stream 仅 GET/HEAD**；写入路由：`/video-player/cookies`（POST 上传 / DELETE，名称白名单 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`、正文 ≤5MB，只写入 `~/.dsh/video-player/cookies/`）、`/video-player/cache`（DELETE，只动插件自己的缓存目录）、`/video-player/queue`（POST，纯内存推送队列，无文件/网络副作用）；
 - 文件访问只允许上述视频扩展名白名单且只允许常规文件；Range 偏移按文件大小校验；
 - 目录清单有上限（2000 个 / 深度 8 层），不可读条目静默跳过；
 - 可访问路径 = 本机 shell 可读范围（GUI 默认只绑定 127.0.0.1）；
@@ -145,7 +149,7 @@ DSH web GUI 客户端插件：侧栏底部多一个「▶ 刷视频」按钮，�
 | --- | --- |
 | `package.json` | 包清单 + `dsh.bundle`（安装层）+ `dsh.client`（浏览器半边发现） |
 | `cordis.patch.yml` | 由 `dsh plugin add` 激活的 bundle 补丁层；注册 `video-player` Loader 行 |
-| `index.js` | 宿主半边（node）：`/video-player/list`（浏览）+ `/video-player/stream`（Range 流式）路由，含 SMB 路径解析 |
+| `index.js` | 宿主半边（node）：`/video-player/list`（本地目录 + yt-dlp 在线列表）+ `/video-player/stream`（本地 Range / 在线代理 / DASH 缓存下载）+ `/video-player/cookies` + `/video-player/cache` + `/video-player/queue`，含 SMB 路径解析 |
 | `client.js` | 浏览器半边（classic script bundle，无构建步骤） |
 
 ### 安装

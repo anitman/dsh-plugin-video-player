@@ -690,6 +690,37 @@ async function handleCache(req, url, res) {
 	}
 }
 
+/* 推送队列：agent（对话）POST 视频 → 播放窗口轮询取走并自动播放。
+ * 30 分钟过期；GET 取走全部（客户端消费式）。 */
+const PUSH_QUEUE = [];
+const PUSH_MAX = 10;
+const PUSH_TTL = 30 * 60 * 1000;
+function pushPrune() {
+	const now = Date.now();
+	while (PUSH_QUEUE.length && now - PUSH_QUEUE[0].ts > PUSH_TTL) PUSH_QUEUE.shift();
+}
+async function handleQueue(req, res) {
+	try {
+		if (req.method === "GET") {
+			pushPrune();
+			const items = PUSH_QUEUE.splice(0, PUSH_QUEUE.length);
+			return json(res, 200, { ok: true, items });
+		}
+		const body = JSON.parse(await readBody(req, 16 * 1024));
+		const url = typeof body.url === "string" ? body.url.trim() : "";
+		if (!url || url.length > 2000) {
+			return json(res, 400, { ok: false, error: "需要 url（视频/播放列表地址，最长 2000 字符）" });
+		}
+		const title = typeof body.title === "string" ? body.title.slice(0, 200) : "";
+		pushPrune();
+		if (PUSH_QUEUE.length >= PUSH_MAX) PUSH_QUEUE.shift();
+		PUSH_QUEUE.push({ url, title, ts: Date.now() });
+		return json(res, 200, { ok: true, queued: PUSH_QUEUE.length });
+	} catch (e) {
+		return json(res, 500, { ok: false, error: String(e.message || e) });
+	}
+}
+
 function json(res, code, body) {
 	res.writeHead(code, {
 		"content-type": "application/json; charset=utf-8",
@@ -799,7 +830,8 @@ function apply(ctx) {
 			const url = new URL(req.url ?? "/", "http://x");
 			const isCookies = url.pathname === "/video-player/cookies";
 			const isCache = url.pathname === "/video-player/cache";
-			const okMethods = isCookies ? ["GET", "POST", "DELETE"] : isCache ? ["GET", "DELETE"] : ["GET", "HEAD"];
+			const isQueue = url.pathname === "/video-player/queue";
+			const okMethods = isCookies ? ["GET", "POST", "DELETE"] : isCache ? ["GET", "DELETE"] : isQueue ? ["GET", "POST"] : ["GET", "HEAD"];
 			if (!okMethods.includes(req.method)) {
 				return json(res, 405, { ok: false, error: "method not allowed" });
 			}
@@ -807,6 +839,7 @@ function apply(ctx) {
 			if (url.pathname === "/video-player/stream") return handleStream(url, req, res);
 			if (isCookies) return handleCookies(req, url, res);
 			if (isCache) return handleCache(req, url, res);
+			if (isQueue) return handleQueue(req, res);
 			return json(res, 404, { ok: false, error: "unknown endpoint" });
 		}
 	});

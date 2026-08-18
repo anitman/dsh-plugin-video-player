@@ -343,7 +343,7 @@ window.__ModuleLoader__.load({
 				onBrowse();
 			}
 
-			async function loadDir(p) {
+			async function loadDir(p, autoplay) {
 				setCard("正在加载…", p, true);
 				input.value = p;
 				try {
@@ -352,6 +352,7 @@ window.__ModuleLoader__.load({
 					dir = data.dir;
 					input.value = dir;
 					renderBrowse(data);
+					if (autoplay && data.videos && data.videos.length) startPlay(data);
 				} catch (e) {
 					if (disposed) return;
 					setCard("无法打开目录", (e && e.message ? e.message : String(e)) + "\n" + p, true);
@@ -856,6 +857,26 @@ window.__ModuleLoader__.load({
 			}
 			window.addEventListener("keydown", onKey);
 
+			/* 对话推送：轮询推送队列，agent 推来的视频自动播放 */
+			async function checkPushQueue() {
+				let items;
+				try {
+					const q = await api("/video-player/queue");
+					items = (q && q.items) || [];
+				} catch {
+					return; // 宿主无推送端点（旧版本）
+				}
+				if (!items.length || disposed) return;
+				for (const it of items) {
+					if (!it || !it.url) continue;
+					flash("📥 来自对话" + (it.title ? "：" + it.title : ""), true);
+					loadDir(it.url, true);
+					break;
+				}
+			}
+			const pushTimer = setInterval(checkPushQueue, 2000);
+			checkPushQueue();
+
 			input.addEventListener("keydown", (e) => {
 				if (e.key === "Enter") {
 					const p = input.value.trim();
@@ -892,6 +913,7 @@ window.__ModuleLoader__.load({
 			function dispose() {
 				if (disposed) return;
 				disposed = true;
+				clearInterval(pushTimer);
 				window.removeEventListener("keydown", onKey);
 				stopPlayback();
 				if (scrollRaf) cancelAnimationFrame(scrollRaf);
