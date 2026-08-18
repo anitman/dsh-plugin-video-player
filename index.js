@@ -452,6 +452,13 @@ async function handleYtStream(ytPath, cookieName, req, res) {
 	if (existsSync(cacheTarget(parsed.watch, cookieName).target)) {
 		return streamLocalFile(cacheTarget(parsed.watch, cookieName).target, req, res);
 	}
+	/* bilibili：优先 1080P 缓存下载（DASH，登录态可 1080P）；
+	 * 下载失败再落到下面的 480P 单文件直连兜底 */
+	if (/bilibili\.com/i.test(watchHost)) {
+		let file = "";
+		try { file = await downloadToCache(parsed.watch, cookieName); } catch { /* 走直连兜底 */ }
+		if (file && existsSync(file)) return streamLocalFile(file, req, res);
+	}
 	let upstream = null;
 	for (let attempt = 0; attempt < 2 && !upstream; attempt++) {
 		let direct;
@@ -538,11 +545,17 @@ async function downloadToCache(watch, cookieName) {
 			"-o", join(dir, id + ".%(ext)s"),
 			watch
 		];
+		let bili = false;
+		try { bili = /bilibili\.com/i.test(new URL(watch).hostname); } catch { bili = false; }
+		/* bilibili 1080P 需登录态（匿名上限 720P）：选了 cookie 时带 cookie 优先；
+		 * 其他站保持匿名优先，避免陈旧 cookie 触发风控 */
+		const first = bili && cookieArg.length ? [...rest, ...cookieArg] : rest;
+		const second = bili && cookieArg.length ? rest : cookieArg.length ? [...rest, ...cookieArg] : [];
 		try {
-			await runYtdlp(rest, 15 * 60 * 1000);
+			await runYtdlp(first, 15 * 60 * 1000);
 		} catch (e) {
-			if (!cookieArg.length) throw e;
-			await runYtdlp([...rest, ...cookieArg], 15 * 60 * 1000); // 匿名失败 → 带 cookie 重试
+			if (!second.length) throw e;
+			await runYtdlp(second, 15 * 60 * 1000); // 兜底重试
 		}
 		if (!existsSync(target)) {
 			/* 扩展名不一致（如 webm 源未合并）→ 按 id 前缀查找 */
