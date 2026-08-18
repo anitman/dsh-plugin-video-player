@@ -652,6 +652,44 @@ async function handleCookies(req, url, res) {
 	}
 }
 
+/* 在线视频本地缓存（DASH 合并的 mp4）：GET 统计 / DELETE 清空（只动缓存目录；播放中占用的跳过） */
+async function handleCache(req, url, res) {
+	try {
+		const hostDirs = (await readdir(CACHE_DIR, { withFileTypes: true }).catch(() => [])).filter((e) => e.isDirectory());
+		if (req.method === "GET") {
+			let count = 0;
+			let totalBytes = 0;
+			for (const d of hostDirs) {
+				const files = await readdir(join(CACHE_DIR, d.name)).catch(() => []);
+				for (const n of files) {
+					const st = await stat(join(CACHE_DIR, d.name, n)).catch(() => null);
+					if (st && st.isFile()) {
+						count++;
+						totalBytes += st.size;
+					}
+				}
+			}
+			return json(res, 200, { ok: true, count, totalBytes });
+		}
+		let removed = 0;
+		let failed = 0;
+		for (const d of hostDirs) {
+			const files = await readdir(join(CACHE_DIR, d.name)).catch(() => []);
+			for (const n of files) {
+				try {
+					await unlink(join(CACHE_DIR, d.name, n));
+					removed++;
+				} catch {
+					failed++;
+				}
+			}
+		}
+		return json(res, 200, { ok: true, removed, failed });
+	} catch (e) {
+		return json(res, 500, { ok: false, error: String(e.message || e) });
+	}
+}
+
 function json(res, code, body) {
 	res.writeHead(code, {
 		"content-type": "application/json; charset=utf-8",
@@ -760,13 +798,15 @@ function apply(ctx) {
 		handler: (req, res) => {
 			const url = new URL(req.url ?? "/", "http://x");
 			const isCookies = url.pathname === "/video-player/cookies";
-			const okMethods = isCookies ? ["GET", "POST", "DELETE"] : ["GET", "HEAD"];
+			const isCache = url.pathname === "/video-player/cache";
+			const okMethods = isCookies ? ["GET", "POST", "DELETE"] : isCache ? ["GET", "DELETE"] : ["GET", "HEAD"];
 			if (!okMethods.includes(req.method)) {
 				return json(res, 405, { ok: false, error: "method not allowed" });
 			}
 			if (url.pathname === "/video-player/list") return handleList(url, res);
 			if (url.pathname === "/video-player/stream") return handleStream(url, req, res);
 			if (isCookies) return handleCookies(req, url, res);
+			if (isCache) return handleCache(req, url, res);
 			return json(res, 404, { ok: false, error: "unknown endpoint" });
 		}
 	});

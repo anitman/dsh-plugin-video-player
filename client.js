@@ -273,7 +273,11 @@ window.__ModuleLoader__.load({
 			cookieFile.type = "file";
 			cookieFile.accept = ".txt";
 			cookieFile.style.display = "none";
-			cookieRow.append(cookieTip, cookieSel, cookieUp, cookieDel, cookieFile);
+			const cacheBtn = el("button", "vdpv-tbtn");
+			cacheBtn.type = "button";
+			cacheBtn.textContent = "🧹";
+			cacheBtn.title = "在线视频本地缓存（DASH 合并的 mp4），点击清空";
+			cookieRow.append(cookieTip, cookieSel, cookieUp, cookieDel, cookieFile, cacheBtn);
 			browseWrap.append(input, cookieRow, rows, playBtn);
 			card.append(cardTitle, cardSub, browseWrap);
 
@@ -331,6 +335,7 @@ window.__ModuleLoader__.load({
 				);
 				input.value = "";
 				refreshCookieSelect();
+				refreshCacheInfo();
 				rows.innerHTML = "";
 				playBtn.textContent = "▶ 播放此文件夹";
 				playBtn.disabled = true;
@@ -363,6 +368,7 @@ window.__ModuleLoader__.load({
 					"\n↑↓ / 拖拽 切换 · ←→ 快进 · 空格 暂停 · M 静音";
 				rows.innerHTML = "";
 				refreshCookieSelect();
+				refreshCacheInfo();
 				if (data.parent) rows.appendChild(makeRow("↑", "上一级", () => loadDir(data.parent), data.parent));
 				for (const d of data.dirs) rows.appendChild(makeRow("📁", d.name, () => loadDir(d.path), d.path));
 				playBtn.textContent = data.videos.length
@@ -463,6 +469,28 @@ window.__ModuleLoader__.load({
 				activeCookie = "";
 				try { localStorage.setItem("vdpv.cookie", ""); } catch { /* ignore */ }
 				await refreshCookieSelect();
+			});
+			/* 在线视频缓存：🧹 显示大小，点击清空 */
+			async function refreshCacheInfo() {
+				try {
+					const c = await api("/video-player/cache");
+					const mb = (c.totalBytes || 0) / 1048576;
+					const human = mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : mb >= 1 ? Math.round(mb) + " MB" : Math.round((c.totalBytes || 0) / 1024) + " KB";
+					cacheBtn.textContent = mb >= 1 ? "🧹 " + (mb >= 1024 ? (mb / 1024).toFixed(1) + "G" : Math.round(mb) + "M") : "🧹";
+					cacheBtn.title = c.count ? "在线视频缓存 " + c.count + " 个文件 · " + human + "，点击清空" : "暂无在线视频缓存，点击清空";
+				} catch {
+					cacheBtn.textContent = "🧹";
+				}
+			}
+			cacheBtn.addEventListener("click", async () => {
+				if (!confirm("清空全部在线视频本地缓存？\n（" + cacheBtn.title + "）")) return;
+				try {
+					const r = await api("/video-player/cache", null, "DELETE");
+					flash("🧹 已清空 " + r.removed + " 个缓存文件" + (r.failed ? "（" + r.failed + " 个正被播放占用，未删除）" : ""), true);
+				} catch (e) {
+					flash("清空缓存失败：" + e.message, true);
+				}
+				await refreshCacheInfo();
 			});
 			browseBtn.addEventListener("click", () => (dir ? loadDir(dir) : welcome()));
 			backTop.addEventListener("click", () => goTo(0));
