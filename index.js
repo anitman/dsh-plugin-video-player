@@ -343,11 +343,16 @@ function isRemoteDir(raw) {
 }
 function makeYtPath(entry, listUrl) {
 	const id = entry.id || "";
-	let watch = entry.url || entry.webpage_url || "";
-	if (!/^https?:\/\//i.test(watch)) {
-		if (/(bilibili\.com)/i.test(listUrl) && /^BV/i.test(id)) watch = "https://www.bilibili.com/video/" + id;
-		else watch = listUrl;
+	const pageRe = /^https?:\/\/(www\.)?bilibili\.com\/video\/BV[0-9A-Za-z]{10}/i;
+	let watch = entry.webpage_url || entry.url || "";
+	if (/bilibili\.com/i.test(listUrl) && /^BV[0-9A-Za-z]{10}$/i.test(id)) {
+		/* 新版 yt-dlp 单视频 -J 会把过期的 CDN 直链填进 entry.url ——
+		 * bilibili 一律规范成视频页地址（带 ?p= 的分 P 地址优先保留） */
+		if (!pageRe.test(watch)) {
+			watch = pageRe.test(entry.url || "") ? entry.url : "https://www.bilibili.com/video/" + id;
+		}
 	}
+	if (!/^https?:\/\//i.test(watch)) watch = listUrl;
 	return "yt|" + watch + "|" + listUrl;
 }
 function parseYtPath(p) {

@@ -508,8 +508,26 @@ window.__ModuleLoader__.load({
 					const bad = el("div", "vdpv-bad");
 					bad.hidden = true;
 					const k = index;
-					video.addEventListener("error", () => {
-						bad.textContent = "⚠️ 该视频无法播放（浏览器可能不支持其编码）\n" + v.name;
+					video.addEventListener("error", async () => {
+						if (!v.video.getAttribute("src")) return;
+						const code = v.video.error ? v.video.error.code : 0;
+						let detail;
+						if (code === 4) {
+							detail = "浏览器无法解码（编码不受支持或文件损坏）";
+						} else {
+							/* 再取一次同一地址，把服务端真实错误带出来（如在线视频下载失败） */
+							try {
+								const r = await fetch(streamUrl(v.path), { headers: { range: "bytes=0-0" } });
+								if (!r.ok) {
+									let msg = "HTTP " + r.status;
+									try { const j = await r.json(); if (j.error) msg = j.error; } catch { /* 非 JSON */ }
+									detail = "加载失败：" + msg;
+								} else detail = "网络中断";
+							} catch {
+								detail = "网络错误";
+							}
+						}
+						bad.textContent = "⚠️ 该视频无法播放（" + detail + "）\n" + v.name;
 						bad.hidden = false;
 					});
 					// 只有“结束时仍是当前视频”才触发自动切换
