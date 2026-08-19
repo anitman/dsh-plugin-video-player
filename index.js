@@ -360,6 +360,63 @@ function parseYtPath(p) {
 	if (i < 0) return null;
 	return { watch: p.slice(3, i), list: p.slice(i + 1) };
 }
+
+/* ── L3 通用页面媒体扫描 ─────────────────────────────────────────────
+ * yt-dlp 提不出（generic 不认的页面）时的兜底：抓页面 HTML，
+ * 用纯通用规则找媒体直链——标签属性 / 内联 JSON / JSON-LD / JS 字符串里
+ * 任何带媒体扩展名的 URL。不含任何站点特判。 */
+function mediaFromHtml(html) {
+	const found = [];
+	const byBare = new Map();
+	const put = (raw) => {
+		if (typeof raw !== "string") return;
+		const u0 = raw.replace(/\\\//g, "/").trim();
+		if (!/^https?:\/\//i.test(u0)) return;
+		/* 站方常写成 .mp4/ 或 .mp4/?token= → 归一化，让直链命中 Range 代理快捷方式 */
+		const u = u0.replace(/(\.(?:mp4|webm|m4v|mov|m3u8|mpd))\/(?=\?|$)/i, "$1");
+		const bare = u.split("?")[0].split("#")[0];
+		if (!/\.(mp4|webm|m4v|mov|m3u8|mpd)$/i.test(bare)) return;
+		/* 同路径去重：优先保留带签名参数的变体（发 v-xxx token 的 CDN 只认签名版） */
+		const i = byBare.get(bare);
+		if (i === undefined) { byBare.set(bare, found.length); found.push(u); }
+		else if (u.includes("?") && !found[i].includes("?")) found[i] = u;
+	};
+	/* 未转义的 URL（覆盖标签 src=、og:video、内联 JSON） */
+	for (const m of html.matchAll(/https?:\/\/[^"'<>\s\\)]+/g)) put(m[0]);
+	/* JSON 里转义斜杠的 URL（"https:\/\/cdn...mp4"） */
+	for (const m of html.matchAll(/https?:\\+\/\\+\/[^"'<>\s]+/g)) put(m[0]);
+	return found;
+}
+async function scanPageMedia(pageUrl, cookieName) {
+	let host = "";
+	try { host = new URL(pageUrl).hostname; } catch { return []; }
+	let cookieHdr = "";
+	try { cookieHdr = cookieName ? await readCookieHeader(cookieName, host) : ""; } catch { cookieHdr = ""; }
+	const headers = { "user-agent": UA };
+	if (cookieHdr) headers.cookie = cookieHdr;
+	let html = "";
+	try {
+		const r = await fetch(pageUrl, { headers, redirect: "follow" });
+		if (!r.ok) return [];
+		const ct = String(r.headers.get("content-type") || "");
+		if (ct && !/html|json|javascript|xml|text/i.test(ct)) return [];
+		html = (await r.text()).slice(0, 8 * 1024 * 1024);
+	} catch { return []; }
+	return mediaFromHtml(html).slice(0, 20);
+}
+function scannedList(rawDir, cookieName, res, key, now, urls) {
+	const out = {
+		dir: rawDir,
+		parent: null,
+		dirs: [],
+		videos: urls.slice(0, MAX_FILES).map((u) => ({
+			name: (u.split("?")[0].split("/").pop() || u).slice(0, 120),
+			path: makeYtPath({ url: u }, rawDir)
+		}))
+	};
+	remoteCache.set(key, { at: now, data: out });
+	return json(res, 200, { ok: true, ...out });
+}
 async function handleRemoteList(rawDir, cookieName, res) {
 	const key = rawDir + "\u0000" + (cookieName || "");
 	const now = Date.now();
@@ -370,6 +427,9 @@ async function handleRemoteList(rawDir, cookieName, res) {
 	try {
 		data = await extractJson(args, cookieName, 45000);
 	} catch (e) {
+		/* L3：yt-dlp 提不出 → 通用 HTML 扫描兜底 */
+		const urls = await scanPageMedia(rawDir, cookieName);
+		if (urls.length) return scannedList(rawDir, cookieName, res, key, now, urls);
 		return json(res, 502, { ok: false, error: "yt-dlp 获取列表失败：" + hintYt(e.message) });
 	}
 	const entries = Array.isArray(data.entries) ? data.entries : [data];
@@ -377,7 +437,12 @@ async function handleRemoteList(rawDir, cookieName, res) {
 		name: e.title || e.id || e.url,
 		path: makeYtPath(e, rawDir)
 	}));
-	if (!videos.length) return json(res, 400, { ok: false, error: "未解析到视频（网址可能不是视频/播放列表页）" });
+	if (!videos.length) {
+		/* L3：yt-dlp 没解析出条目 → 同样走通用扫描 */
+		const urls = await scanPageMedia(rawDir, cookieName);
+		if (urls.length) return scannedList(rawDir, cookieName, res, key, now, urls);
+		return json(res, 400, { ok: false, error: "未解析到视频（网址可能不是视频/播放列表页）" });
+	}
 	const out = { dir: rawDir, parent: null, dirs: [], videos };
 	remoteCache.set(key, { at: now, data: out });
 	return json(res, 200, { ok: true, ...out });
